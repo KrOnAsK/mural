@@ -60,10 +60,10 @@ import org.webrtc.audio.JavaAudioDeviceModule.AudioTrackStartErrorCode
 class LiveTransport(
     context: Context,
     private val scope: CoroutineScope,
-) {
-    var onEvent: ((JsonObject) -> Unit)? = null
-    var onFailure: ((String) -> Unit)? = null
-    var onLevels: ((Double, Double) -> Unit)? = null
+) : VoiceTransport {
+    override var onEvent: ((JsonObject) -> Unit)? = null
+    override var onFailure: ((String) -> Unit)? = null
+    override var onLevels: ((Double, Double) -> Unit)? = null
 
     private val applicationContext = context.applicationContext
     private val audioManager = applicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -152,7 +152,7 @@ class LiveTransport(
     }
 
     /** True means accepted for delivery; every native operation runs on the audio worker. */
-    fun send(event: JsonObject): Boolean {
+    override fun send(event: JsonObject, respond: Boolean): Boolean {
         val attempt = activeAttempt ?: return false
         if (!isCurrent(attempt) || !attempt.channelOpen.get()) return false
         audioScope.launch {
@@ -172,12 +172,20 @@ class LiveTransport(
         } catch (_: Exception) { false }
     }
 
-    fun mute(muted: Boolean) {
+    override fun mute(muted: Boolean) {
         val attempt = activeAttempt ?: return
         mutedState = muted
         audioScope.launch {
             if (!isCurrent(attempt)) return@launch
-            try { attempt.track?.setEnabled(!muted) } catch (_: Exception) { }
+            try {
+                // Keep the WebRTC media clock moving while replacing microphone
+                // samples with silence. Disabling the track can stall GPT-Live's
+                // context timeline, leaving typed replies waiting indefinitely.
+                checkNotNull(attempt.audioDeviceModule).setMicrophoneMute(muted)
+            } catch (_: Exception) {
+                fail(attempt, applicationContext.getString(R.string.error_transport_audio_stopped))
+                return@launch
+            }
             sendNow(attempt, buildJsonObject {
                 put("type", if (muted) "session.input_audio.mute" else "session.input_audio.unmute")
                 put("event_id", UUID.randomUUID().toString())
@@ -185,7 +193,7 @@ class LiveTransport(
         }
     }
 
-    fun close() {
+    override fun close() {
         val attempt = activeAttempt ?: return
         attempt.closing.set(true)
         attempt.ownership.close()
@@ -200,7 +208,7 @@ class LiveTransport(
         }
     }
 
-    fun disconnect() {
+    override fun disconnect() {
         val detached = detachAttempt()
         // This scope outlives the ViewModel so clearing the screen cannot cancel native cleanup.
         audioScope.launch { drainRetiredAttempts() }

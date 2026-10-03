@@ -9,6 +9,18 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ConversationProvidersTest {
+    @Test fun continuationSurvivesRelaunchOnlyForItsOwnerLanguageAndBoundary() {
+        val session = SessionRecord(languageID = "nb", themeID = "food").apply { endedAt = nowSeconds(); endReason = "Time limit" }
+        val checkpoint = ConversationContinuationCheckpoint(session.id, "original-owner")
+        val encoded = Json.encodeToString(kotlinx.serialization.serializer<ConversationContinuationCheckpoint>(), checkpoint)
+        val restored = Json.decodeFromString<ConversationContinuationCheckpoint>(encoded)
+        assertEquals(session.id, restored.recover(listOf(session), "original-owner", "nb")?.id)
+        assertNull(restored.recover(listOf(session), "other-owner", "nb"))
+        assertNull(restored.recover(listOf(session), "original-owner", "es"))
+        assertNull(restored.recover(emptyList(), "original-owner", "nb"))
+        session.endReason = "Imported unfinished conversation"
+        assertNull(restored.recover(listOf(session), "original-owner", "nb"))
+    }
     private val response = APIResult("Hola", emptyList(), APIUsage(12, 4))
     private class Teacher(val action: suspend (HelperPurpose?) -> APIResult) : TeachingClient {
         override suspend fun respond(instructions: String, input: String, schema: JsonObject?, search: Boolean,
@@ -18,6 +30,28 @@ class ConversationProvidersTest {
         status: suspend () -> HostedSessionStatus = { status("closed") }) =
         HostedConversationBindings.Lease("server-a", teacher, close, status)
     private fun status(state: String) = HostedSessionStatus("server-a", state, 600_000, 1000, 600_000, null)
+
+    @Test fun streamWaitersShareOneFundedRequestAndOnlyOneReceivesUsage() = runTest {
+        var calls = 0; var callback: ((String) -> Unit)? = null
+        val finished = CompletableDeferred<APIResult>()
+        val teacher = object : TeachingClient {
+            override suspend fun respond(instructions: String, input: String, schema: JsonObject?, search: Boolean, purpose: HelperPurpose?): APIResult = error("Must use streaming")
+            override suspend fun streamMeaning(instructions: String, input: String, onText: (String) -> Unit): APIResult {
+                calls++; callback = onText; return finished.await()
+            }
+        }
+        val controller = HostedConversationBindings(backgroundScope)
+        controller.bind("local", "owner", lease(teacher))
+        val firstSeen = mutableListOf<String>(); val secondSeen = mutableListOf<String>()
+        val first = launch { controller.respond("local", HelperPurpose.MEANING, "same", "policy", "input", onText = { firstSeen += it }) }
+        runCurrent(); callback!!("Ho"); first.cancelAndJoin()
+        val second = async { controller.respond("local", HelperPurpose.MEANING, "same", "policy", "input", onText = { secondSeen += it }) }
+        runCurrent(); callback!!("Hola"); finished.complete(response); runCurrent()
+        assertEquals(listOf("Ho"), firstSeen); assertEquals(listOf("Ho", "Hola"), secondSeen)
+        assertEquals(response.usage, second.await().usage)
+        assertEquals(APIUsage(), controller.respond("local", HelperPurpose.MEANING, "same", "policy", "input", onText = {}).usage)
+        assertEquals(1, calls)
+    }
 
     @Test fun selectionNeverFallsBackBetweenPersonalKeyAndHosted() {
         val ready = HostedReadiness("owner", 1, true)
@@ -145,6 +179,17 @@ class ConversationProvidersTest {
             assertEquals(text, text.toByteArray(Charsets.UTF_8).toString(Charsets.UTF_8))
         }
         assertEquals("😀", ConversationHistory.utf8Prefix("😀😀", 5))
+    }
+
+    @Test fun continuationHistoryRejectsControlCharactersAndFitsEachServerMessage() {
+        val session = SessionRecord(languageID = "es", title = "test")
+        session.append(Fragment(speaker = Speaker.user, text = "bad\u0001message", startMS = 0, endMS = 1))
+        session.append(Fragment(speaker = Speaker.assistant, text = "😀".repeat(2000), startMS = 2, endMS = 3))
+        val history = ConversationHistory.messages(session)
+        assertEquals(1, history.size)
+        val text = history.single().jsonObject["content"]!!.jsonArray.single().jsonObject["text"]!!.jsonPrimitive.content
+        assertEquals(4000, text.toByteArray(Charsets.UTF_8).size)
+        assertEquals("😀".repeat(1000), text)
     }
 
     @Test fun hostedProvenanceExcludesRecoveryAfterRestartAndPassageEdits() {

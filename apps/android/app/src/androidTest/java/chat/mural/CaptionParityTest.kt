@@ -18,6 +18,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
+import okio.buffer
 import kotlinx.serialization.json.*
 import org.junit.*
 import org.junit.Assert.*
@@ -34,9 +35,12 @@ class CaptionParityTest {
     private lateinit var vm: MuralViewModel
     private lateinit var original: String
     private lateinit var originalAPI: APIClient
+    private lateinit var originalProvider: ConversationProvider
+    private lateinit var originalReadiness: HostedReadiness
     private var originalHasKey = false
     private val requests = LinkedBlockingQueue<String>()
     @Volatile private var responseGate: CountDownLatch? = null
+    @Volatile private var streamGate: CountDownLatch? = null
     @Volatile private var responseCode = 200
     @Volatile private var response = "This word is explained in the context of the sentence."
     private val recording get() = InstrumentationRegistry.getArguments().getString("record") == "true"
@@ -47,6 +51,7 @@ class CaptionParityTest {
         vm = compose.awaitHistoryLoaded()
         compose.runOnIdle {
             original = ArchiveCodec.encode(vm.archive); originalHasKey = vm.hasKey
+            originalProvider = vm.conversationProvider; originalReadiness = vm.hostedReadiness
             val field = MuralViewModel::class.java.getDeclaredField("api").apply { isAccessible = true }
             originalAPI = field.get(vm) as APIClient
             // An application interceptor returns before DNS or a socket can be used. No provider key or network is involved.
@@ -65,6 +70,30 @@ class CaptionParityTest {
                     }) })
                     put("usage", buildJsonObject { put("input_tokens", 0); put("output_tokens", 0) })
                 }
+                if (Json.parseToJsonElement(body).jsonObject["stream"] == JsonPrimitive(true) && status == 200) {
+                    val partial = buildJsonObject { put("type", "response.output_text.delta"); put("delta", reply.take(5)) }
+                    val completion = buildJsonObject { put("type", "response.completed"); put("response", payload) }
+                    val prefix = Buffer().writeUtf8("data: $partial\n\n")
+                    val suffix = Buffer().writeUtf8("data: $completion\n\n")
+                    val gate = streamGate
+                    val source = object : okio.Source {
+                        override fun read(sink: Buffer, byteCount: Long): Long {
+                            if (!prefix.exhausted()) return prefix.read(sink, byteCount)
+                            gate?.await(15, TimeUnit.SECONDS)
+                            return suffix.read(sink, byteCount)
+                        }
+                        override fun timeout() = okio.Timeout.NONE
+                        override fun close() { gate?.countDown() }
+                    }
+                    val streamBody = object : ResponseBody() {
+                        private val buffered = source.buffer()
+                        override fun contentType() = "text/event-stream".toMediaType()
+                        override fun contentLength() = -1L
+                        override fun source() = buffered
+                    }
+                    return@addInterceptor Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                        .header("Content-Type", "text/event-stream").body(streamBody).build()
+                }
                 Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(status).message(if (status == 200) "OK" else "Fixture error")
                     .body(payload.toString().toResponseBody("application/json".toMediaType())).build()
             }.build()
@@ -81,6 +110,7 @@ class CaptionParityTest {
     }
     @After fun restore() {
         responseGate?.countDown()
+        streamGate?.countDown()
         finishRecording()
         if (!::vm.isInitialized || !::original.isInitialized) return
         compose.runOnIdle {
@@ -88,6 +118,8 @@ class CaptionParityTest {
             MuralViewModel::class.java.getDeclaredField("voiceSession").apply { isAccessible = true }.setBoolean(vm, false)
             MuralViewModel::class.java.getDeclaredField("api").apply { isAccessible = true }.set(vm, originalAPI)
             state("hasKey", originalHasKey)
+            state("conversationProvider", originalProvider)
+            state("hostedReadiness", originalReadiness)
             val restored = ArchiveCodec.decode(original)
             state("archive", restored); vm.updatePreferences(restored.preferences)
         }
@@ -101,8 +133,16 @@ class CaptionParityTest {
             state("meaning", meaning)
             // Written fixture: the microphone is off throughout the recording.
             state("state", "active")
+            assertEquals("Caption fixture language was not applied", language, vm.language.id)
+            assertEquals(language, vm.session?.languageID)
         }
-        compose.waitForIdle()
+        // Wait for this fixture's captions, not just an idle frame of the previous language.
+        // The Mandarin reading is produced off the Compose test clock.
+        val displayedCaption = text.ifBlank { LanguageRegistry.get(language)!!.greeting }
+        compose.waitUntil(10_000) {
+            compose.onAllNodes(hasTestTag("target-caption") and hasText(displayedCaption)).fetchSemanticsNodes().size == 1 &&
+                compose.onAllNodes(hasTestTag("meaning-caption") and hasText(meaning)).fetchSemanticsNodes().size == 1
+        }
         if (language == "zh") compose.waitUntil(10_000) {
             compose.onAllNodesWithTag("pinyin-reading").fetchSemanticsNodes().isNotEmpty()
         }
@@ -162,6 +202,42 @@ class CaptionParityTest {
         Thread.sleep(800); recorder?.close(); recorder = null
     }
 
+    @Test fun compactIdleGreetingAndMeaningStayFullyVisibleWithMicStateChange() {
+        compose.runOnIdle {
+            state("session", null)
+            state("state", "idle")
+            state("conversationProvider", ConversationProvider.HOSTED_MINUTES)
+            state("hostedReadiness", HostedReadiness("guest", 534_000, enabled = true, verified = true))
+            vm.updatePreferences(vm.archive.preferences.copy(learningLanguageID = "nb", meaningLanguage = "English",
+                meaningVisible = true))
+        }
+        compose.onNodeWithTag("target-caption").assertTextEquals("Hei!")
+        compose.onNodeWithTag("meaning-caption").assertTextEquals("Hi!")
+        compose.onNodeWithTag("talk-guest-minutes").assertDoesNotExist()
+        compose.onNodeWithText("8 min 54 sec of Mural minutes remaining").assertDoesNotExist()
+        compose.onNodeWithText("Microphone off").assertDoesNotExist()
+        compose.onNodeWithText("Reply in whichever language comes to you.").assertDoesNotExist()
+        compose.onNodeWithTag("start-conversation").assertContentDescriptionEquals("Start conversation")
+        assertTextVisible("target-caption", true)
+        assertTextVisible("meaning-caption", true)
+        val target = compose.onNodeWithTag("target-caption").fetchSemanticsNode().boundsInRoot
+        val meaning = compose.onNodeWithTag("meaning-caption").fetchSemanticsNode().boundsInRoot
+        val microphone = compose.onNodeWithTag("start-conversation").fetchSemanticsNode().boundsInRoot
+        val orb = compose.onNodeWithTag("talk-orb").fetchSemanticsNode().boundsInRoot
+        capture("compact-idle-greeting")
+        assertTrue("Greeting and meaning overlap: target=$target meaning=$meaning", target.bottom <= meaning.top)
+        assertTrue("Meaning overlaps microphone: meaning=$meaning microphone=$microphone", meaning.bottom <= microphone.top)
+        assertTrue("Orb shrank below 120 dp", orb.width / compose.density.density >= 119f)
+        compose.runOnIdle { state("hostedReadiness", HostedReadiness()) }
+        compose.onNodeWithText("Couldn’t check your Mural minutes.").assertDoesNotExist()
+        compose.runOnIdle {
+            MuralViewModel::class.java.getDeclaredField("voiceSession").apply { isAccessible = true }.setBoolean(vm, true)
+            state("state", "active")
+        }
+        compose.onNodeWithTag("start-conversation").assertContentDescriptionEquals("Mute microphone")
+        capture("active-voice-mic")
+    }
+
     @Test fun mandarinCaptionToggleAndContextualLookupMatchIOS() {
         val sentence = "我想去银行，然后去旅行。"
         show("zh", sentence, "I want to go to the bank, then travel.")
@@ -180,6 +256,8 @@ class CaptionParityTest {
     }
 
     @Test fun spanishCaptionAndContextualLookupMatchIOS() {
+        show("zh", "我想去银行。", "I want to go to the bank.")
+        compose.onNodeWithTag("pinyin-toggle").assertExists()
         val sentence = "Quiero un café con leche."
         show("es", sentence, "I want a coffee with milk.")
         response = "Café means ‘coffee’ in this sentence. Un café con leche is a coffee with milk."
@@ -190,18 +268,62 @@ class CaptionParityTest {
         compose.onNodeWithTag("word-lookup-close").performClick(); pause()
     }
 
-    @Test fun allEightLanguagesSendTheTappedWordWithItsOriginalSentence() {
+    @Test fun allLanguagesSendTheTappedWordWithItsOriginalSentence() {
         val samples = listOf(
             Triple("nb", "Jeg vil ha kaffe.", "kaffe"), Triple("es", "Quiero un café.", "café"),
             Triple("en", "I would like coffee.", "coffee"), Triple("fr", "Je voudrais du café.", "café"),
             Triple("de", "Ich möchte Kaffee.", "Kaffee"), Triple("it", "Vorrei un caffè.", "caffè"),
-            Triple("pt", "Quero um café.", "café"), Triple("zh", "我想去银行。", "银行"))
+            Triple("pt", "Quero um café.", "café"), Triple("zh", "我想去银行。", "银行"),
+            Triple("sr", "Hoću jednu kafu.", "kafu"), Triple("el", "Θα ήθελα έναν καφέ.", "καφέ"),
+            Triple("tl", "Gusto ko ng kape.", "kape"))
         assertEquals(LanguageRegistry.all.map { it.id }.toSet(), samples.map { it.first }.toSet())
         for ((language, sentence, word) in samples) {
             show(language, sentence, "A short practice sentence.")
+            if (language != "zh") compose.onNodeWithTag("pinyin-toggle").assertDoesNotExist()
             compose.onNodeWithTag("target-caption").performScrollTo()
             tap(word, sentence)
             compose.onNodeWithTag("word-lookup-close").performClick()
+        }
+    }
+
+    @Test fun everyLanguagePreservesProviderFragmentsAndDisplaysMeaningBeforeCompletion() {
+        val samples = mapOf(
+            "nb" to listOf("Hygg", "elig! Jeg liker fri", "luftsliv."),
+            "en" to listOf("That is inter", "esting."),
+            "es" to listOf("Me gusta apren", "der espa", "ñol."),
+            "fr" to listOf("Aujourd", "’hui, c’est inté", "ressant."),
+            "de" to listOf("Das ist eine Sprach", "lern", "anwendung."),
+            "it" to listOf("È una conver", "sazione interes", "sante."),
+            "pt" to listOf("Estou apren", "dendo portu", "guês."),
+            "zh" to listOf("我", "喜欢", "学习", "中文。"),
+            "sr" to listOf("Volim da uči", "m srp", "ski."),
+            "el" to listOf("Πώς εί", "σαι; Μα", "ΐου."),
+            "tl" to listOf("Mag-", "aaral ako araw-", "araw."))
+        assertEquals(LanguageRegistry.all.map { it.id }.toSet(), samples.keys)
+        for ((language, parts) in samples) {
+            show(language, "", "")
+            val gate = CountDownLatch(1); streamGate = gate; response = "Meaning for $language"
+            compose.runOnIdle {
+                vm.updatePreferences(vm.archive.preferences.copy(meaningVisible = false))
+                state("session", SessionRecord(languageID = language, title = "Synthetic stream verification"))
+                val handle = MuralViewModel::class.java.getDeclaredMethod("handle", JsonObject::class.java).apply { isAccessible = true }
+                parts.forEachIndexed { index, part -> handle.invoke(vm, buildJsonObject {
+                    put("type", "session.output_transcript.delta"); put("delta", part)
+                    put("start_ms", index * 100); put("end_ms", (index + 1) * 100); put("event_id", "$language-$index")
+                }) }
+                vm.updatePreferences(vm.archive.preferences.copy(meaningVisible = true))
+                MuralViewModel::class.java.getDeclaredMethod("scheduleTranslation", Boolean::class.javaPrimitiveType)
+                    .apply { isAccessible = true }.invoke(vm, true)
+            }
+            compose.onNodeWithTag("target-caption").assertTextEquals(parts.joinToString(""))
+            compose.waitUntil(10_000) { vm.meaning == response.take(5) }
+            compose.onNodeWithTag("meaning-caption").assertTextEquals(response.take(5))
+            compose.runOnIdle { assertTrue(vm.session!!.translations.isEmpty()) }
+            gate.countDown()
+            compose.waitUntil(10_000) { vm.meaning == response }
+            compose.runOnIdle { assertEquals(listOf(response), vm.session!!.translations.values.toList()) }
+            capture("stream-$language")
+            streamGate = null
         }
     }
 
@@ -412,6 +534,8 @@ class CaptionParityTest {
         android.util.Log.i("MuralCaptionCheck", "Long caption: render")
         show("zh", sentence, "Hello! Nice to meet you. Your Chinese is good. We can go to a café, then the bank, and buy a few things. What do you think?")
         assertTextVisible("target-caption", false); assertTextVisible("meaning-caption", false)
+        val orb = compose.onNodeWithTag("talk-orb").fetchSemanticsNode().boundsInRoot
+        assertTrue("Orb shrank below 120 dp", orb.width / compose.density.density >= 119f)
         android.util.Log.i("MuralCaptionCheck", "Long caption: capture")
         capture("mandarin-long-caption")
         android.util.Log.i("MuralCaptionCheck", "Long caption: scroll reading")

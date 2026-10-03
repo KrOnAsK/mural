@@ -23,7 +23,7 @@ data class MeaningRequest(
         learningLanguageID == other.learningLanguageID && meaningLanguage == other.meaningLanguage
 
     companion object {
-        fun cacheKey(revisionKey: String, language: String) = "$language::$revisionKey"
+        fun cacheKey(revisionKey: String, language: String) = "caption2/$language::$revisionKey"
         fun translationInput(text: String): String = text
     }
 }
@@ -43,6 +43,7 @@ class MeaningController(
     private val retryDelay: (Throwable) -> Long? = { null },
     private val minimumSpacingMillis: Long = 2500,
     private val now: () -> Long = { System.nanoTime() / 1_000_000 },
+    private val stream: (suspend (MeaningRequest, (String) -> Unit) -> MeaningResult)? = null,
     private val translate: suspend (MeaningRequest) -> MeaningResult,
 ) {
     var text = ""; private set
@@ -53,6 +54,9 @@ class MeaningController(
 
     private var desired: MeaningRequest? = null
     private var rendered: MeaningRequest? = null
+    private var displayed: MeaningRequest? = null
+    private var activeTranslation: Long? = null
+    private var nextTranslation = 0L
     private var worker: Job? = null
     private var generation = 0
     private var translating = false
@@ -72,7 +76,7 @@ class MeaningController(
                 it.learningLanguageID == request.learningLanguageID && it.meaningLanguage == request.meaningLanguage } == true
             if (translating && sameConversation) {
                 // A new display passage waits for the current request instead of starting a second helper.
-                rendered = null; text = ""; error = null; finalRequested = false; finalRetryAvailable = false; sessionEnded = false
+                rendered = null; displayed = null; text = ""; error = null; finalRequested = false; finalRetryAvailable = false; sessionEnded = false
                 automaticRetries = 0; retryWindowStartedAt = null; retryNotBefore = 0; pendingFailure = null
             } else reset()
         }
@@ -91,12 +95,12 @@ class MeaningController(
         }
         if (!cached.isNullOrEmpty()) {
             if (!translating) cancelWorker()
-            text = cached; rendered = request; error = null; isLoading = false
+            text = cached; rendered = request; displayed = request; error = null; isLoading = false
             pendingFailure = null; retryNotBefore = 0
             onChange?.invoke(); return
         }
         if (rendered == request) return
-        rendered?.let { if (!request.text.startsWith(it.text)) { text = ""; rendered = null } }
+        displayed?.let { if (!request.text.startsWith(it.text)) { text = ""; rendered = null; displayed = null } }
         // A waiting timer follows the latest fragment; an admitted request is never cancelled by speech.
         if (!translating && (changed || utteranceComplete || conversationEnded)) cancelWorker()
         if (worker == null && error == null) begin()
@@ -104,7 +108,7 @@ class MeaningController(
     }
 
     fun reset() {
-        cancelWorker(); desired = null; rendered = null; text = ""; error = null
+        cancelWorker(); desired = null; rendered = null; displayed = null; text = ""; error = null
         finalRequested = false; finalRetryAvailable = false; sessionEnded = false
         automaticRetries = 0; retryWindowStartedAt = null; retryNotBefore = 0; pendingFailure = null
         onChange?.invoke()
@@ -120,11 +124,14 @@ class MeaningController(
     }
 
     private fun cancelWorker() {
-        generation++; worker?.cancel(); worker = null; isLoading = false; translating = false
+        generation++; activeTranslation = null; worker?.cancel(); worker = null; isLoading = false; translating = false
     }
 
-    private fun endsSentence(value: String): Boolean =
-        value.trimEnd().trimEnd('"', '\'', '”', '’', '»', ')').lastOrNull() in setOf('.', '!', '?', '。', '！', '？', '…')
+    private fun endsSentence(value: String, languageID: String): Boolean {
+        val last = value.trimEnd().trimEnd('"', '\'', '”', '’', '»', ')').lastOrNull()
+        return last in setOf('.', '!', '?', '。', '！', '？', '…') ||
+            (languageID == "el" && last in setOf(';', ';'))
+    }
 
     private fun prepareAutomaticRetry(failure: Throwable, wait: Long): Boolean {
         val current = now()
@@ -144,7 +151,7 @@ class MeaningController(
             try {
                 val initial = desired ?: return@launch
                 val current = now()
-                val quietUntil = desiredUpdatedAt + if (finalRequested) 0 else if (endsSentence(initial.text)) delayMillis else incompleteDelayMillis
+                val quietUntil = desiredUpdatedAt + if (finalRequested) 0 else if (endsSentence(initial.text, initial.learningLanguageID)) delayMillis else incompleteDelayMillis
                 val pacedUntil = lastDispatchedAt?.let { it + minimumSpacingMillis } ?: current
                 delay((maxOf(quietUntil, pacedUntil, retryNotBefore) - current).coerceAtLeast(0))
                 val request = desired
@@ -154,13 +161,23 @@ class MeaningController(
                 }
                 pendingFailure = null; retryNotBefore = 0
                 translating = true; lastDispatchedAt = now(); dispatched = request
-                val result = translate(request)
+                val translation = ++nextTranslation; activeTranslation = translation
+                // Retain the readable prefix until the next stream has caught up.
+                val minimumPartialLength = text.length
+                val result = if (stream == null) translate(request) else stream.invoke(request) { partial ->
+                    val latest = desired
+                    if (token == generation && activeTranslation == translation && latest != null && rendered != latest &&
+                        latest.sharesContext(request) && latest.text.startsWith(request.text) && partial.isNotEmpty() && partial.length >= minimumPartialLength) {
+                        text = partial; displayed = request; onChange?.invoke()
+                    }
+                }
                 val latest = desired
                 if (token != generation || latest == null) return@launch
+                activeTranslation = null
                 if (result.text.isBlank()) throw EmptyMeaningException()
                 onResult?.invoke(request, result)
                 if (rendered != latest && latest.sharesContext(request) && latest.text.startsWith(request.text)) {
-                    text = result.text; rendered = request
+                    text = result.text; rendered = request; displayed = request
                 }
                 worker = null; isLoading = false; translating = false
                 if (latest != request) begin()
@@ -169,7 +186,7 @@ class MeaningController(
                 if (token == generation) throw e
             } catch (e: Exception) {
                 if (token != generation) return@launch
-                worker = null; isLoading = false; translating = false
+                activeTranslation = null; worker = null; isLoading = false; translating = false
                 if (rendered == desired) { error = null; onChange?.invoke(); return@launch }
                 if (dispatched != null && desired?.sharesContext(dispatched) == false) {
                     // Do not retry or render the old passage; continue with the separately requested new one.

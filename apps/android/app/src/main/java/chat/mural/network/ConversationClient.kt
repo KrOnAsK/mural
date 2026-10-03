@@ -15,6 +15,11 @@ enum class HelperPurpose(val wireValue: String) {
 interface TeachingClient {
     suspend fun respond(instructions: String, input: String, schema: JsonObject? = null,
         search: Boolean = false, purpose: HelperPurpose? = null): APIResult
+    suspend fun streamMeaning(instructions: String, input: String, onText: (String) -> Unit): APIResult {
+        val result = respond(instructions, input, purpose = HelperPurpose.MEANING)
+        onText(result.text)
+        return result
+    }
 }
 
 data class LiveSessionRequest(val sdp: String, val instructions: String, val history: JsonArray = JsonArray(emptyList()),
@@ -24,6 +29,18 @@ data class LiveSessionRequest(val sdp: String, val instructions: String, val his
 
 interface LiveSessionProvider {
     suspend fun createLiveSession(request: LiveSessionRequest): LiveSessionConnection
+}
+
+/** The conversation coordinator's view of a voice connection. Callbacks arrive on the coordinator's scope. */
+interface VoiceTransport {
+    var onEvent: ((JsonObject) -> Unit)?
+    var onFailure: ((String) -> Unit)?
+    var onLevels: ((Double, Double) -> Unit)?
+    /** [respond] asks a turn-based engine to speak now; a realtime model decides that itself. */
+    fun send(event: JsonObject, respond: Boolean = false): Boolean
+    fun mute(muted: Boolean)
+    fun close()
+    fun disconnect()
 }
 
 /** Lease metadata is opaque to the native audio layer. It never contains credentials or prompt text. */
