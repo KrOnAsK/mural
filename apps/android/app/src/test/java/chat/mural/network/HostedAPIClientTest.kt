@@ -2,6 +2,8 @@ package chat.mural.network
 
 import chat.mural.core.AccountSession
 import chat.mural.core.LanguageRegistry
+import chat.mural.core.LearningEngine
+import chat.mural.core.TeachingPolicy
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.*
@@ -24,6 +26,37 @@ class HostedAPIClientTest {
     private fun status(state: String = "closing") = """{"sessionID":"$sessionID","state":"$state","deadline":"2023-11-14T22:23:20Z","observedMilliseconds":1000,"reservedMilliseconds":600000,"chargedMilliseconds":null,"billingBasis":"connected-conversation-time","providerCostNanoUSD":null}"""
     @Before fun setup() { server = MockWebServer(); server.start(); api = HostedAPIClient(server.url("/"), { stored }, OkHttpClient(), { now }) }
     @After fun teardown() { server.shutdown() }
+
+    @Test fun streamedMeaningAndOlderServerFallbackUseOneRequestAndKeepUsage() = runBlocking {
+        server.enqueue(MockResponse().setBody(created()))
+        val lease = api.createLiveSession(create).lease as HostedAPIClient.HostedLease
+        server.takeRequest()
+        var mode = "stream"
+        server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+                assertEquals("text/event-stream", request.getHeader("Accept"))
+                assertEquals(JsonPrimitive("meaning"), body["purpose"])
+                val result = """{"requestID":${body["requestID"]},"text":"你好 café","sources":[],"usage":{"inputTokens":12,"cachedInputTokens":0,"cacheWriteTokens":0,"outputTokens":7,"searchCalls":0},"costNanoUSD":"100","rateVersion":"test"}"""
+                if (mode == "json") return MockResponse().setHeader("Content-Type", "application/json").setBody(result)
+                val ending = if (mode == "failure") """{"type":"mural.meaning.error","code":"helper_response_uncertain"}"""
+                    else """{"type":"mural.meaning.completed","result":$result}"""
+                val stream = "data: {\"type\":\"mural.meaning.delta\",\"delta\":\"你好\"}\n\n" +
+                    "data: {\"type\":\"mural.meaning.delta\",\"delta\":\" café\"}\n\n" + "data: $ending\n\n"
+                return MockResponse().setHeader("Content-Type", "text/event-stream").setChunkedBody(stream, 1)
+            }
+        }
+        for (value in listOf("stream", "json")) {
+            mode = value; val seen = mutableListOf<String>()
+            val result = lease.teaching.streamMeaning("policy", "input") { seen += it }
+            assertEquals("你好 café", result.text); assertEquals(APIUsage(12, 7), result.usage)
+            assertEquals(if (mode == "stream") listOf("你好", "你好 café") else listOf("你好 café"), seen)
+        }
+        mode = "failure"
+        try { lease.teaching.streamMeaning("policy", "input") {}; fail("Accepted incomplete stream") }
+        catch (_: HostedFailure.Unconfirmed) { }
+        assertEquals(4, server.requestCount)
+    }
 
     @Test fun paidSessionKeepsTheRequestedDurationAndActualCostBilling() = runBlocking {
         val metadata = """"fundingMode":"ai-value","billingBasis":"actual-ai-usage","limitMilliseconds":1800000,"reservedNanoUSD":"3005000000","minimumChargeMilliseconds":15000,"billingPolicy":"actual-ai-usage-15s-minimum-v1""""
@@ -113,6 +146,19 @@ class HostedAPIClientTest {
         server.enqueue(MockResponse().setBody(created()))
         api.createLiveSession(create.copy(history = JsonArray(listOf(valid))))
         assertEquals(JsonArray(listOf(valid)), Json.parseToJsonElement(server.takeRequest().body.readUtf8()).jsonObject["history"])
+    }
+
+    @Test fun selectedThemeIsPreservedInTheHostedSessionRequest() = runBlocking {
+        for (language in LanguageRegistry.all) {
+            val theme = language.themes.first { it.id == "dinner" }
+            val prompt = TeachingPolicy.voice(language, LearningEngine.project(emptyList(), languageID = language.id),
+                theme, "An unrelated interest", "English")
+            server.enqueue(MockResponse().setBody(created()))
+            api.createLiveSession(create.copy(language = language.locale, instructions = prompt))
+            val body = Json.parseToJsonElement(server.takeRequest().body.readUtf8()).jsonObject
+            assertEquals(prompt, body["instructions"]!!.jsonPrimitive.content)
+            assertTrue(body["instructions"]!!.jsonPrimitive.content.contains(theme.situation))
+        }
     }
 
     @Test fun statusAndHelpersStayWithCreatingAccountButCleanupUsesOriginalIdentityOnce() = runBlocking {
